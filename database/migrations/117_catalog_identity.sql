@@ -108,6 +108,6 @@ CREATE INDEX IF NOT EXISTS idx_catalog_match_review ON catalog_match_decisions (
 CREATE INDEX IF NOT EXISTS idx_products_canonical_variant ON products (canonical_variant_id);
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON catalog_products, catalog_variants, product_offers, product_identifiers, catalog_match_decisions TO app_user;
-GRANT USAGE, SELECT ON SEQUENCES catalog_products_id_seq, catalog_variants_id_seq, product_offers_id_seq, product_identifiers_id_seq, catalog_match_decisions_id_seq TO app_user;
+GRANT USAGE, SELECT ON SEQUENCE catalog_products_id_seq, catalog_variants_id_seq, product_offers_id_seq, product_identifiers_id_seq, catalog_match_decisions_id_seq TO app_user;
 
 COMMIT;
