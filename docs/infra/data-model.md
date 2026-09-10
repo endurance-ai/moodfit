@@ -13,6 +13,7 @@
 | | ~~`analysis_sessions`~~ | ~~021~~→**087 드롭** | **migration 087 DROP (2026-05-22)** — 레거시 refine 세션. /api/analyze + user-voice 제거에 동반 |
 | **상품** | `products` | 004 + 005 + 006 + 011 + 027 + **070** + **107** + **110** | 크롤로 들어온 모든 SKU. **070: id uuid→bigserial 전환 (2026-05-18)**. `gender` 는 크롤러 write-path의 단일 출처이며, 크롤러 색상 컬럼 `color` 는 **107 에서 DROP**. 색상 정본은 `product_features.feature_metadata->>'primary_color'`. **`image_url`이 serving/search/embedding 대표 이미지 SOT**이고 `images[0]`은 호환용 mirror다. 110은 대표 변경 시 이미지 파생 자산을 자동 무효화한다. |
 | | `product_features` | **095** (실물은 2026-07-28 선행 생성) | **VLM 이 만드는 이미지 파생 피처 — color 의 단일 출처.** PK `product_id` → products.id ON DELETE CASCADE. `feature_metadata jsonb` (`primary_color`(16 canonical family UPPERCASE) / `secondary_colors` / `material` / `pattern` / `style_tags` / `neckline` / `details` / `fit`, + 레거시 `gender` 스칼라), `retrieval_text`, `text_embedding halfvec(768)` + HNSW. 진행률은 097 의 `product_features_coverage` 로 본다 |
+| | `product_catalog_jobs` | **118** | 신규·동일성·대표 이미지 변경 상품의 대표 이미지→VLM 피처→임베딩→교차몰 매핑을 연결하는 내구성 큐. 상품별 최신 generation만 완료할 수 있고 lease 기반 claim 및 3회 재시도를 지원한다. 가격·재고 변경만으로는 enqueue하지 않는다. |
 | | `product_embeddings` | **071 + 110** | canonical `products.image_url`의 FashionSigLIP(768) 임베딩. halfvec + HNSW, product_id bigint PK/FK. 대표 이미지 변경·소실 시 110 트리거가 자동 삭제한다. |
 | | `product_image_failures` | **110** | 대표 이미지 다운로드 실패 상태. retryable은 `next_retry_at` 이후 재시도하고 permanent는 같은 `image_url`이 유지되는 동안 격리한다. URL 변경 시 자동 삭제된다. |
 | | `product_reviews` | 019 | 상품 리뷰. **070 에서 product_id uuid→bigint swap** |
@@ -219,6 +220,7 @@ SELECT p.platform,
 | **098** | **`products.product_url` 중복 UNIQUE 제약 정리 (2026-07-31)** — 같은 컬럼에 `products_product_url_key` 와 `uq_products_product_url` 이 동시에 걸려 인덱스가 이중(각 29 MB)으로 유지되고 있었다. 저장공간 29 MB + `product_url` 쓰기마다 인덱스 2개 갱신. 008 이 명시적으로 만든 `uq_products_product_url` 을 남기고, 어느 마이그에도 정의가 없는(070 테이블 재구축 잔재로 추정) 자동 명명 제약을 DROP. FK 4개는 모두 `products.id` 를 보므로 무영향, PostgREST upsert(onConflict=product_url)도 컬럼 기준이라 그대로 동작. |
 | **097** | **`product_features` 커버리지 뷰 (2026-07-30)** — `product_features_coverage`(플랫폼별 진행률 + `with_gender`) + `product_features_pending`(VLM 배치가 소비할 대기열). 131,058행이 단일 벌크로 생성됐고 증분 경로가 없어, features 없는 상품이 색상 필터에서 완화 없이 탈락하는 것을 가시화·해소하기 위한 것. 추가 전용(뷰 2개). |
 | **107** | **`products.color` DROP (2026-08-14)** — 크롤러 원본 색상 컬럼과 남은 직접 조회를 제거. `admin_crawl_platform_stats.fill_color` 응답 계약은 유지하되 `product_features.feature_metadata->>'primary_color'` 커버리지를 집계한다. |
+| **118** | **상품 카탈로그 후처리 큐** — products 신규·동일성·이미지 변경을 `product_catalog_jobs`에 generation-fenced upsert하고 claim/complete/retry RPC를 제공한다. |
 
 ---
 
