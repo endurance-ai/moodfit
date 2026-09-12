@@ -1,0 +1,18 @@
+services:
+  pipeline-db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: kiko_pipeline_test
+      POSTGRES_USER: pipeline_admin
+      POSTGRES_PASSWORD: pipeline_test_only
+    ports:
+      - "127.0.0.1:15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pipeline_admin -d kiko_pipeline_test"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      - /var/lib/postgresql/data
+    volumes:
+      - ./pipeline-db-fixture.sql:/docker-entrypoint-initdb.d/001-fixture.sql:ro

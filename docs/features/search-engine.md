@@ -1,5 +1,7 @@
 # 검색 엔진
 
+> 상품 image embedding write는 migration 121의 URL/revision provenance 계약을 사용한다. 세 Python caller가 모두 `bulk_update_product_embeddings_v2`로 전환된 것을 확인한 뒤 migration 123을 별도로 적용한다. 상세 배포·복구 순서는 [`../../../kikoai/kikoai-handoff/pipeline-integrity/rollout-runbook.md`](../../../kikoai/kikoai-handoff/pipeline-integrity/rollout-runbook.md)를 따른다.
+
 > `/api/find/search` (메인 플로우 Step 5) — **v6 embedding-first 단일 엔진** (SPEC-SEARCH-V6-001, 2026-05-18).
 > ~~`/api/search-products`~~ — **feature/redesign-admin에서 삭제됨** (v6 search-debugger 전환, `src/domains/search-v4/` 전체 제거).
 

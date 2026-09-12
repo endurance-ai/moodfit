@@ -20,8 +20,8 @@ Behavior
      canonical products.image_url; images[0] is only a compatibility mirror.
   2. Download the resolved image URL in parallel (ThreadPool 20).
   3. GPU/CPU batch (64) encode + L2-normalize.
-  4. UPSERT into product_embeddings via bulk_update_product_embeddings RPC
-     (reworked: ON CONFLICT product_id DO UPDATE, bigint product_id).
+  4. Store through bulk_update_product_embeddings_v2 with the URL and image
+     revision captured before download; count only explicit applied outcomes.
   5. Repeat until no pending rows remain.
 """
 from __future__ import annotations
@@ -50,19 +50,39 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024
 HTTP_TIMEOUT = 20
 
 
-def download_one(client: httpx.Client, pid: int, url: str) -> Optional[tuple[int, Image.Image]]:
+def classify_write_results(batch: list[dict], response: object) -> dict[str, int]:
+    """Count explicit v2 outcomes; absent or malformed result rows are failures."""
+    counts = {"applied": 0, "stale": 0, "missing": 0, "failed": 0}
+    results = response if isinstance(response, list) else []
+    by_id = {
+        str(item.get("id")): item.get("outcome")
+        for item in results
+        if isinstance(item, dict)
+    }
+    for item in batch:
+        outcome = by_id.get(str(item["id"]))
+        if outcome in {"applied", "stale", "missing"}:
+            counts[outcome] += 1
+        else:
+            counts["failed"] += 1
+    return counts
+
+
+def download_one(
+    client: httpx.Client, pid: str, url: str, revision: str
+) -> Optional[tuple[str, str, str, Image.Image]]:
     try:
         r = client.get(url)
         r.raise_for_status()
         if len(r.content) > MAX_IMAGE_BYTES:
             return None
         img = Image.open(io.BytesIO(r.content)).convert("RGB")
-        return (pid, img)
+        return (pid, url, revision, img)
     except Exception:
         return None
 
 
-def fetch_pending(sb, page_limit: int) -> list[dict]:
+def fetch_pending(sb, page_limit: int, after_id: str | None = None) -> list[dict]:
     """Products with no product_embeddings row.
 
     products.image_url is the serving/search source of truth. Only active
@@ -77,16 +97,18 @@ def fetch_pending(sb, page_limit: int) -> list[dict]:
     later pass. The caller loops until this returns empty; each UPSERT pass
     shrinks the anti-join result, so no cross-call cursor is needed.
     """
-    resp = (
+    query = (
         sb.table("products")
-        .select("id,image_url,product_embeddings(product_id)")
+        .select("id,image_url,image_revision,product_embeddings(product_id)")
         .is_("product_embeddings", "null")
         .eq("in_stock", True)
         .not_.is_("image_url", "null")
         .order("id")
         .limit(page_limit)
-        .execute()
     )
+    if after_id is not None:
+        query = query.gt("id", after_id)
+    resp = query.execute()
     return resp.data or []
 
 
@@ -117,7 +139,10 @@ def main() -> int:
     total_embedded = 0
     total_skipped = 0
     total_failed = 0
+    total_stale = 0
+    total_missing = 0
     processed = 0
+    last_id: str | None = None
     t_start = time.time()
 
     with httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=True) as http:
@@ -129,27 +154,28 @@ def main() -> int:
                     break
                 page_limit = min(FETCH_PAGE, remaining)
 
-            rows = fetch_pending(sb, page_limit)
+            rows = fetch_pending(sb, page_limit, last_id)
             if not rows:
                 print("[done] no more pending products")
                 break
+            last_id = str(rows[-1]["id"])
 
-            jobs: list[tuple[int, str]] = []
+            jobs: list[tuple[str, str, str]] = []
             for row in rows:
                 src = row.get("image_url")
                 if not src:
                     total_skipped += 1
                     continue
-                jobs.append((int(row["id"]), src))
+                jobs.append((str(row["id"]), str(src), str(row["image_revision"])))
 
             if not jobs:
                 processed += len(rows)
                 continue
 
             # parallel download — 20 workers
-            fetched: list[tuple[int, Image.Image]] = []
+            fetched: list[tuple[str, str, str, Image.Image]] = []
             with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
-                futures = [pool.submit(download_one, http, pid, u) for pid, u in jobs]
+                futures = [pool.submit(download_one, http, pid, url, revision) for pid, url, revision in jobs]
                 for f in as_completed(futures):
                     result = f.result()
                     if result is None:
@@ -165,39 +191,45 @@ def main() -> int:
             updates: list[dict] = []
             for i in range(0, len(fetched), GPU_BATCH):
                 chunk = fetched[i : i + GPU_BATCH]
-                tensors = torch.stack([preprocess(img) for _, img in chunk]).to(device)
+                tensors = torch.stack([preprocess(img) for _, _, _, img in chunk]).to(device)
                 with torch.no_grad():
                     feats = model.encode_image(tensors)
                     feats = feats / feats.norm(dim=-1, keepdim=True)
                 vecs = feats.cpu().float().numpy()
-                for (pid, _), vec in zip(chunk, vecs):
+                for (pid, source_url, source_revision, _), vec in zip(chunk, vecs):
                     updates.append({
                         "id": str(pid),  # bigint product_id (RPC casts ::bigint)
                         "embedding": "[" + ",".join(f"{x:.6f}" for x in vec.tolist()) + "]",
                         "model": EMBEDDING_MODEL_NAME,
+                        "source_image_url": source_url,
+                        "source_image_revision": source_revision,
                     })
 
             for i in range(0, len(updates), RPC_BATCH):
                 batch = updates[i : i + RPC_BATCH]
-                # bulk_update_product_embeddings reworked (migration 071):
-                # UPSERT into product_embeddings, ON CONFLICT product_id.
-                sb.rpc("bulk_update_product_embeddings", {"payload": batch}).execute()
+                response = sb.rpc("bulk_update_product_embeddings_v2", {"payload": batch}).execute()
+                counts = classify_write_results(batch, response.data)
+                total_embedded += counts["applied"]
+                total_stale += counts["stale"]
+                total_missing += counts["missing"]
+                total_failed += counts["failed"]
 
-            total_embedded += len(updates)
             processed += len(rows)
             elapsed = time.time() - t_start
             rate = total_embedded / elapsed if elapsed > 0 else 0
             print(
                 f"[page] processed={processed} embedded={total_embedded} "
+                f"stale={total_stale} missing={total_missing} "
                 f"skipped={total_skipped} failed={total_failed} rate={rate:.1f}/s"
             )
 
     print(
         f"[end] processed={processed} embedded={total_embedded} "
+        f"stale={total_stale} missing={total_missing} "
         f"skipped={total_skipped} failed={total_failed} "
         f"elapsed={round(time.time() - t_start, 1)}s"
     )
-    return 0
+    return 1 if total_failed + total_stale + total_missing > 0 else 0
 
 
 if __name__ == "__main__":
